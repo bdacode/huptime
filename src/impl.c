@@ -107,12 +107,15 @@ static pthread_mutex_t mutex;
         pthread_mutex_unlock(&mutex);    \
     } while(0)
 
+/* Our restart signal pipe. */
+static int restart_pipe[2] = { -1, -1 };
+
 /* Our core signal handlers. */
 static void* impl_restart_thread(void*);
 void
 sighandler(int signo)
 {
-    /* Fire off a restart thread.
+    /* Notify the restart thread.
      * We have to do this in a separate thread, because
      * we have no guarantees about which thread has been
      * interrupted in order to execute this signal handler.
@@ -121,11 +124,40 @@ sighandler(int signo)
      * fire the restart asycnhronously so that it too can
      * grab locks appropriately. */
     DEBUG("Restart caught.");
-    pthread_t thread;
-    pthread_attr_t thread_attr;
-    pthread_attr_init(&thread_attr);
-    pthread_attr_setdetachstate(&thread_attr, 1);
-    pthread_create(&thread, &thread_attr, impl_restart_thread, NULL);
+
+    if( restart_pipe[1] == -1 )
+    {
+        /* We've already run. */
+        return;
+    }
+
+    while( 1 )
+    {
+        char go = 'R';
+        int rc = write(restart_pipe[1], &go, 1);
+        if( rc == 0 )
+        {
+            /* Wat? Try again. */
+            continue;
+        }
+        else if( rc == 1 )
+        {
+            /* Done. */
+            libc.close(restart_pipe[1]);
+            restart_pipe[1] = -1;
+        }
+        else if( rc < 0 && (errno == EAGAIN || errno == EINTR) )
+        {
+            /* Go again. */
+            continue;
+        }
+        else
+        {
+            /* Shit. */
+            DEBUG("Restart pipe fubared!? Sorry.");
+            break;
+        }
+    }
 }
 
 static int
@@ -655,6 +687,28 @@ impl_init(void)
     exe_copy = (char*)read_link("/proc/self/exe");
     DEBUG("Saved exe.");
 
+    /* Create our restart thread.
+     *
+     * See the note in sighandler() for an explanation
+     * of why the restart must be done in a separate thread.
+     *
+     * We do the thread creation here instead of in the
+     * handler because pthread_create() is not a signal-safe
+     * function to call from the handler. */
+    if( pipe(restart_pipe) < 0 )
+    {
+        DEBUG("Error creating restart pipes: %s",
+              strerror(errno));
+    }
+    else
+    {
+        pthread_t thread;
+        pthread_attr_t thread_attr;
+        pthread_attr_init(&thread_attr);
+        pthread_attr_setdetachstate(&thread_attr, 1);
+        pthread_create(&thread, &thread_attr, impl_restart_thread, NULL);
+    }
+
     /* Install our signal handlers.
      * We also ensure that they are unmasked. This
      * is important because we may have specifically
@@ -908,6 +962,38 @@ impl_restart(void)
 void*
 impl_restart_thread(void* arg)
 {
+    /* Wait for our signal. */
+    while (1)
+    {
+        char go = 0;
+        int rc = read(restart_pipe[0], &go, 1);
+        if( rc == 1 )
+        {
+            /* Go. */
+            break;
+        }
+        else if( rc == 0 )
+        {
+            /* Wat? Restart. */
+            DEBUG("Restart pipe closed?!");
+            break;
+        }
+        else if( rc < 0 && (errno == EAGAIN || errno == EINTR) )
+        {
+            /* Keep trying. */
+            continue;
+        }
+        else
+        {
+            /* Real error. Let's restart. */
+            DEBUG("Restart pipe fubared?!");
+            break;
+        }
+    }
+
+    libc.close(restart_pipe[0]);
+    restart_pipe[0] = -1;
+
     /* See note above in sighandler(). */
     impl_restart();
     return arg;
